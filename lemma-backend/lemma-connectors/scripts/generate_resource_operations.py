@@ -139,6 +139,31 @@ def normalize_sentence(value: str) -> str:
     return compact
 
 
+_VALID_ESCAPE_CHARS = frozenset("\\\"'nrtabfv01234567xNuU\n")
+
+
+def _description_has_invalid_escape(text: str) -> bool:
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            if i + 1 >= n or text[i + 1] not in _VALID_ESCAPE_CHARS:
+                return True
+        i += 1
+    return False
+
+
+def _format_method_docstring(description: str, parameter_hint: str) -> str:
+    if not _description_has_invalid_escape(description):
+        safe = description.replace('"""', '\\"\\"\\"')
+        return f'"""{safe}\n\nImportant inputs: {parameter_hint}"""'
+    if '"""' not in description:
+        return f'r"""{description}\n\nImportant inputs: {parameter_hint}"""'
+    safe = description.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    return f'"""{safe}\n\nImportant inputs: {parameter_hint}"""'
+
+
+
 def build_operation_models(tool: dict[str, Any], operation_name: str) -> str:
     input_name = pascal_case(f"{operation_name}_input")
     output_name = pascal_case(f"{operation_name}_output")
@@ -167,7 +192,8 @@ def build_method(tool: dict[str, Any], operation_name: str, action: str) -> str:
     if tool.get("request_body") is not None:
         parameter_names.append("body")
     parameter_hint = ", ".join(parameter_names) if parameter_names else "No explicit inputs."
-    description = normalize_sentence(tool.get("description") or "").replace('"""', '\\"\\"\\"')
+    description = normalize_sentence(tool.get("description") or "")
+    docstring = _format_method_docstring(description, parameter_hint)
     return "\n".join(
         [
             "    @operation(",
@@ -179,7 +205,7 @@ def build_method(tool: dict[str, Any], operation_name: str, action: str) -> str:
             f"        tags=tuple({tool.get('tags', [])!r}),",
             "    )",
             f"    async def {method_name}(self, data: {input_name}) -> {output_name}:",
-            f'        """{description}\n\nImportant inputs: {parameter_hint}"""',
+            f"        {docstring}",
             f"        tool = self._client.get_tool({tool['name']!r})",
             "        result = await tool.execute(data.model_dump(exclude_none=True, exclude_unset=True, by_alias=False))",
             "        return output_name.model_validate(coerce_tool_result(result))".replace(
@@ -231,26 +257,45 @@ def build_resource_file(
     )
 
 
-def build_init_file(app_name: str, resources: list[str]) -> str:
-    import_lines = [
-        f"from lemma_connectors.{app_name}.resources.{resource} import {pascal_case(f'{app_name}_{resource}_resource')}"
-        for resource in resources
-    ]
-    mapping_lines = [
-        f"        {resource!r}: {pascal_case(f'{app_name}_{resource}_resource')}(client),"
-        for resource in resources
+def build_init_file(
+    app_name: str,
+    resources: list[str],
+    operation_to_resource: dict[str, str],
+) -> str:
+    registry_lines = []
+    for slug in resources:
+        module_path = f"lemma_connectors.{app_name}.resources.{slug}"
+        class_name = pascal_case(f"{app_name}_{slug}_resource")
+        registry_lines.append(f"    {slug!r}: ({module_path!r}, {class_name!r}),")
+    operation_lines = [
+        f"    {operation_name!r}: {slug!r},"
+        for operation_name, slug in sorted(operation_to_resource.items())
     ]
     return "\n".join(
         [
             "from __future__ import annotations",
             "",
-            *import_lines,
+            "import importlib",
+            "",
+            "OPERATION_TO_RESOURCE: dict[str, str] = {",
+            *operation_lines,
+            "}",
+            "",
+            "RESOURCE_REGISTRY: dict[str, tuple[str, str]] = {",
+            *registry_lines,
+            "}",
+            "",
+            "",
+            "def build_resource(client, resource_slug: str):",
+            '    """Lazily import and build a single resource client by slug."""',
+            "    module_path, class_name = RESOURCE_REGISTRY[resource_slug]",
+            "    module = importlib.import_module(module_path)",
+            "    return getattr(module, class_name)(client)",
             "",
             "",
             "def build_resources(client):",
-            "    return {",
-            *mapping_lines,
-            "    }",
+            '    """Eagerly build all resource clients (backward-compatible)."""',
+            "    return {slug: build_resource(client, slug) for slug in RESOURCE_REGISTRY}",
             "",
         ]
     )
@@ -265,9 +310,11 @@ def main() -> None:
 
     metadata = json.loads(Path(args.metadata).read_text())
     tools_by_resource: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    operation_to_resource: dict[str, str] = {}
     for tool in metadata["tools"]:
-        resource, _, _ = operation_parts(tool, args.app)
+        resource, _, operation_name = operation_parts(tool, args.app)
         tools_by_resource[resource].append(tool)
+        operation_to_resource[operation_name] = resource
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -282,7 +329,9 @@ def main() -> None:
             )
         )
 
-    (output_dir / "__init__.py").write_text(build_init_file(args.app, sorted(tools_by_resource)))
+    (output_dir / "__init__.py").write_text(
+        build_init_file(args.app, sorted(tools_by_resource), operation_to_resource)
+    )
 
 
 if __name__ == "__main__":
